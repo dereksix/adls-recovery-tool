@@ -1,0 +1,7 @@
+# Output files
+ADLSRecovery_*/
+*.log
+*.csv
+
+# Don't commit filled-in configs with keys
+# ADLSRestore-Config.ps1 is committed as a template with empty values
