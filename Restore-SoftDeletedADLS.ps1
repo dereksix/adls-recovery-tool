@@ -1,8 +1,14 @@
 <#
 .SYNOPSIS
-    ADLS Gen2 Data Recovery — Interactive script for restoring soft-deleted items.
+    Azure Storage Data Recovery — Interactive script for restoring soft-deleted items.
 
 .DESCRIPTION
+    Supports BOTH storage account types:
+      - ADLS Gen2 (hierarchical namespace enabled)
+      - Blob Storage (flat namespace)
+
+    Auto-detects which type each account is and uses the correct cmdlets.
+
     Reads storage accounts from ADLSRestore-Config.ps1, checks prerequisites,
     then walks you through: Inventory (what was deleted) -> Restore (get it back).
 
@@ -22,7 +28,7 @@
 $ErrorActionPreference = "Stop"
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
 $startTime = Get-Date -AsUTC
-$scriptVersion = "4.0.0"
+$scriptVersion = "5.0.0"
 
 function Format-Size([long]$bytes) {
     if ($bytes -ge 1GB) { return "{0:N2} GB" -f ($bytes / 1GB) }
@@ -37,7 +43,8 @@ function Format-Size([long]$bytes) {
 
 Write-Host ""
 Write-Host "  ============================================================" -ForegroundColor Cyan
-Write-Host "    ADLS Gen2 Data Recovery Tool  v$scriptVersion" -ForegroundColor Cyan
+Write-Host "    Azure Storage Data Recovery Tool  v$scriptVersion" -ForegroundColor Cyan
+Write-Host "    Supports ADLS Gen2 and Blob Storage" -ForegroundColor Cyan
 Write-Host "  ============================================================" -ForegroundColor Cyan
 Write-Host ""
 
@@ -153,11 +160,11 @@ Write-Host "  Output folder: $OutputFolder"
 Write-Host ""
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  STEP 1 — TEST CONNECTIONS
+#  STEP 1 — TEST CONNECTIONS & DETECT STORAGE TYPE
 # ══════════════════════════════════════════════════════════════════════════════
 
 Write-Host "  ────────────────────────────────────────────────────────────" -ForegroundColor Cyan
-Write-Host "  Step 1: Testing connections..." -ForegroundColor Cyan
+Write-Host "  Step 1: Testing connections and detecting storage type..." -ForegroundColor Cyan
 Write-Host "  ────────────────────────────────────────────────────────────" -ForegroundColor Cyan
 Write-Host ""
 
@@ -167,9 +174,30 @@ foreach ($acct in $Accounts) {
     $name = $acct.StorageAccountName
     try {
         $ctx = New-AzStorageContext -StorageAccountName $name -StorageAccountKey $acct.StorageAccountKey -ErrorAction Stop
-        # Quick test — list filesystems
-        $null = Get-AzDataLakeGen2FileSystem -Context $ctx -ErrorAction Stop
-        Write-Host "    [OK] $name" -ForegroundColor Green
+
+        # Detect storage type: try ADLS Gen2 (HNS) first, fall back to Blob
+        $storageType = 'Unknown'
+        try {
+            $null = Get-AzDataLakeGen2ChildItem -Context $ctx -FileSystem $acct.FileSystem -Path $acct.Path -MaxCount 1 -ErrorAction Stop
+            $storageType = 'ADLS Gen2'
+        } catch {
+            $errMsg = $_.ToString()
+            if ($errMsg -match 'hierarchical namespace' -or $errMsg -match 'HierarchicalNamespaceNotEnabled' -or $errMsg -match 'FilesystemNotFound' -eq $false) {
+                # Not HNS — try Blob Storage
+                try {
+                    $null = Get-AzStorageContainer -Name $acct.FileSystem -Context $ctx -ErrorAction Stop
+                    $storageType = 'Blob'
+                } catch {
+                    throw "Could not access container '$($acct.FileSystem)': $_"
+                }
+            } else {
+                # It IS HNS but path might be empty or not exist yet — that's OK
+                $storageType = 'ADLS Gen2'
+            }
+        }
+
+        $acct['StorageType'] = $storageType
+        Write-Host "    [OK] $name ($storageType)" -ForegroundColor Green
         $validAccounts.Add($acct)
     } catch {
         Write-Host "    [FAIL] $name — $_" -ForegroundColor Red
@@ -185,8 +213,13 @@ if ($validAccounts.Count -eq 0) {
     exit 1
 }
 
+$adlsCount = ($validAccounts | Where-Object { $_.StorageType -eq 'ADLS Gen2' }).Count
+$blobCount = ($validAccounts | Where-Object { $_.StorageType -eq 'Blob' }).Count
+
 Write-Host ""
 Write-Host "  $($validAccounts.Count) of $($Accounts.Count) accounts connected." -ForegroundColor Green
+if ($adlsCount -gt 0) { Write-Host "    ADLS Gen2:    $adlsCount" -ForegroundColor Green }
+if ($blobCount -gt 0)  { Write-Host "    Blob Storage: $blobCount" -ForegroundColor Green }
 Write-Host ""
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -204,6 +237,7 @@ $allInventory = $validAccounts | ForEach-Object -Parallel {
     $outputFolder = $using:OutputFolder
 
     $name = $acct.StorageAccountName
+    $storageType = $acct.StorageType
     $logFile = Join-Path $outputFolder "${name}_$($acct.FileSystem)_inventory.log"
     $csvFile = Join-Path $outputFolder "${name}_$($acct.FileSystem)_inventory.csv"
 
@@ -211,54 +245,125 @@ $allInventory = $validAccounts | ForEach-Object -Parallel {
 
     $ctx = New-AzStorageContext -StorageAccountName $name -StorageAccountKey $acct.StorageAccountKey -ErrorAction Stop
 
-    $token = $null
     $items = [System.Collections.Generic.List[PSCustomObject]]::new()
     $errors = @()
 
-    do {
-        try {
-            $deleted = Get-AzDataLakeGen2DeletedItem -Context $ctx -FileSystem $acct.FileSystem `
-                -Path $acct.Path -MaxCount 100 -ContinuationToken $token -ErrorAction Stop
+    if ($storageType -eq 'ADLS Gen2') {
+        # ── ADLS Gen2 inventory ──────────────────────────────────────
+        $token = $null
+        do {
+            try {
+                $deleted = Get-AzDataLakeGen2DeletedItem -Context $ctx -FileSystem $acct.FileSystem `
+                    -Path $acct.Path -MaxCount 100 -ContinuationToken $token -ErrorAction Stop
 
-            if (-not $deleted -or $deleted.Count -eq 0) { break }
+                if (-not $deleted -or $deleted.Count -eq 0) { break }
 
-            foreach ($d in $deleted) {
-                $deletedOn = $d.DeletedOn
-                $deletedOnStr = if ($deletedOn) { $deletedOn.ToString('yyyy-MM-dd HH:mm:ss UTC') } else { '(unknown)' }
-                $contentLength = try { $d.ContentLength } catch { 0 }
-                if (-not $contentLength) { $contentLength = 0 }
+                foreach ($d in $deleted) {
+                    $deletedOn = $d.DeletedOn
+                    $deletedOnStr = if ($deletedOn) { $deletedOn.ToString('yyyy-MM-dd HH:mm:ss UTC') } else { '(unknown)' }
+                    $contentLength = try { $d.ContentLength } catch { 0 }
+                    if (-not $contentLength) { $contentLength = 0 }
 
-                $retentionDaysNum = try { $d.RemainingRetentionDays } catch { $null }
-                $remainingDays = ''
-                $urgency = 'UNKNOWN'
-                if ($retentionDaysNum) {
-                    $remainingDays = $retentionDaysNum
-                    $urgency = if ($retentionDaysNum -le 3) { 'CRITICAL' } elseif ($retentionDaysNum -le 7) { 'WARNING' } else { 'OK' }
-                } elseif ($deletedOn) {
-                    $daysSince = [math]::Floor(((Get-Date -AsUTC) - $deletedOn).TotalDays)
-                    $remainingDays = "(deleted ${daysSince}d ago)"
+                    $retentionDaysNum = try { $d.RemainingRetentionDays } catch { $null }
+                    $remainingDays = ''
+                    $urgency = 'UNKNOWN'
+                    if ($retentionDaysNum) {
+                        $remainingDays = $retentionDaysNum
+                        $urgency = if ($retentionDaysNum -le 3) { 'CRITICAL' } elseif ($retentionDaysNum -le 7) { 'WARNING' } else { 'OK' }
+                    } elseif ($deletedOn) {
+                        $daysSince = [math]::Floor(((Get-Date -AsUTC) - $deletedOn).TotalDays)
+                        $remainingDays = "(deleted ${daysSince}d ago)"
+                    }
+
+                    $items.Add([PSCustomObject]@{
+                        StorageAccount   = $name
+                        StorageType      = 'ADLS Gen2'
+                        FileSystem       = $acct.FileSystem
+                        Path             = $d.Path
+                        IsDirectory      = if ($d.IsDirectory) { $true } else { $false }
+                        ItemType         = if ($d.Path -match '_delta_log') { '_delta_log' } else { 'data' }
+                        DeletedOn        = $deletedOnStr
+                        RemainingDays    = $remainingDays
+                        RetentionUrgency = $urgency
+                        SizeBytes        = $contentLength
+                        DeletionId       = try { $d.DeletionId } catch { '' }
+                    })
                 }
 
-                $items.Add([PSCustomObject]@{
-                    StorageAccount   = $name
-                    FileSystem       = $acct.FileSystem
-                    Path             = $d.Path
-                    IsDirectory      = if ($d.IsDirectory) { $true } else { $false }
-                    ItemType         = if ($d.Path -match '_delta_log') { '_delta_log' } else { 'data' }
-                    DeletedOn        = $deletedOnStr
-                    RemainingDays    = $remainingDays
-                    RetentionUrgency = $urgency
-                    SizeBytes        = $contentLength
-                    DeletionId       = try { $d.DeletionId } catch { '' }
-                })
+                $token = $deleted[$deleted.Count - 1].ContinuationToken
+            } catch {
+                $errors += $_.ToString()
+                break
             }
+        } while (-not [string]::IsNullOrEmpty($token))
 
-            $token = $deleted[$deleted.Count - 1].ContinuationToken
-        } catch {
-            $errors += $_.ToString()
-            break
-        }
-    } while (-not [string]::IsNullOrEmpty($token))
+    } else {
+        # ── Blob Storage inventory ───────────────────────────────────
+        $token = $null
+        do {
+            try {
+                $blobParams = @{
+                    Container         = $acct.FileSystem
+                    Context           = $ctx
+                    IncludeDeleted    = $true
+                    MaxCount          = 100
+                    ErrorAction       = 'Stop'
+                }
+                # Scope to prefix if path is not root
+                $pathPrefix = $acct.Path.Trim('/')
+                if ($pathPrefix -and $pathPrefix -ne '') {
+                    $blobParams['Prefix'] = $pathPrefix
+                }
+                if ($token) {
+                    $blobParams['ContinuationToken'] = $token
+                }
+
+                $blobResult = Get-AzStorageBlob @blobParams
+
+                if (-not $blobResult -or $blobResult.Count -eq 0) { break }
+
+                foreach ($blob in $blobResult) {
+                    # Only process deleted blobs
+                    if (-not $blob.IsDeleted) { continue }
+
+                    $deletedOn = $blob.DeletedOn
+                    $deletedOnStr = if ($deletedOn) { $deletedOn.ToString('yyyy-MM-dd HH:mm:ss UTC') } else { '(unknown)' }
+                    $contentLength = try { $blob.Length } catch { 0 }
+                    if (-not $contentLength) { $contentLength = 0 }
+
+                    $retentionDaysNum = try { $blob.RemainingDaysBeforePermanentDelete } catch { $null }
+                    $remainingDays = ''
+                    $urgency = 'UNKNOWN'
+                    if ($retentionDaysNum) {
+                        $remainingDays = $retentionDaysNum
+                        $urgency = if ($retentionDaysNum -le 3) { 'CRITICAL' } elseif ($retentionDaysNum -le 7) { 'WARNING' } else { 'OK' }
+                    } elseif ($deletedOn) {
+                        $daysSince = [math]::Floor(((Get-Date -AsUTC) - $deletedOn).TotalDays)
+                        $remainingDays = "(deleted ${daysSince}d ago)"
+                    }
+
+                    $items.Add([PSCustomObject]@{
+                        StorageAccount   = $name
+                        StorageType      = 'Blob'
+                        FileSystem       = $acct.FileSystem
+                        Path             = $blob.Name
+                        IsDirectory      = $false
+                        ItemType         = if ($blob.Name -match '_delta_log') { '_delta_log' } else { 'data' }
+                        DeletedOn        = $deletedOnStr
+                        RemainingDays    = $remainingDays
+                        RetentionUrgency = $urgency
+                        SizeBytes        = $contentLength
+                        DeletionId       = ''
+                    })
+                }
+
+                $token = $blobResult[$blobResult.Count - 1].ContinuationToken
+            } catch {
+                $errors += $_.ToString()
+                break
+            }
+        } while (-not [string]::IsNullOrEmpty($token))
+    }
 
     # Write per-account CSV
     if ($items.Count -gt 0) {
@@ -267,7 +372,7 @@ $allInventory = $validAccounts | ForEach-Object -Parallel {
 
     # Write per-account log
     $logContent = @(
-        "Account: $name / $($acct.FileSystem) / $($acct.Path)"
+        "Account: $name / $($acct.FileSystem) / $($acct.Path) ($storageType)"
         "Scanned: $(Get-Date -AsUTC -Format 'yyyy-MM-dd HH:mm:ss UTC')"
         "Items found: $($items.Count)"
         if ($errors.Count -gt 0) { "Errors: $($errors -join '; ')" }
@@ -278,6 +383,7 @@ $allInventory = $validAccounts | ForEach-Object -Parallel {
 
     [PSCustomObject]@{
         StorageAccount = $name
+        StorageType    = $storageType
         FileSystem     = $acct.FileSystem
         Path           = $acct.Path
         ItemCount      = $items.Count
@@ -317,8 +423,9 @@ foreach ($inv in $allInventory) {
     $totalWarning += $inv.Warning
 
     $color = if ($inv.Errors) { 'Red' } elseif ($inv.ItemCount -eq 0) { 'Yellow' } else { 'Green' }
+    $typeLabel = if ($inv.StorageType) { " ($($inv.StorageType))" } else { '' }
 
-    Write-Host "    $($inv.StorageAccount) / $($inv.FileSystem)" -ForegroundColor $color
+    Write-Host "    $($inv.StorageAccount) / $($inv.FileSystem)$typeLabel" -ForegroundColor $color
     Write-Host "      Deleted items: $($inv.ItemCount)  |  Size: $sizeStr"
 
     if ($inv.Critical -gt 0) {
@@ -401,6 +508,7 @@ $restoreResults = $validAccounts | ForEach-Object -Parallel {
     $outputFolder = $using:OutputFolder
 
     $name = $acct.StorageAccountName
+    $storageType = $acct.StorageType
     $logFile = Join-Path $outputFolder "${name}_$($acct.FileSystem)_restore.log"
     $csvFile = Join-Path $outputFolder "${name}_$($acct.FileSystem)_restore.csv"
 
@@ -414,73 +522,155 @@ $restoreResults = $validAccounts | ForEach-Object -Parallel {
     }
 
     $ctx = New-AzStorageContext -StorageAccountName $name -StorageAccountKey $acct.StorageAccountKey -ErrorAction Stop
-    Write-RestoreLog "Connected to $name"
+    Write-RestoreLog "Connected to $name ($storageType)"
 
-    # Discover deleted items
-    $token = $null
-    $toRestore = [System.Collections.Generic.List[object]]::new()
-
-    do {
-        try {
-            $deleted = Get-AzDataLakeGen2DeletedItem -Context $ctx -FileSystem $acct.FileSystem `
-                -Path $acct.Path -MaxCount 100 -ContinuationToken $token -ErrorAction Stop
-
-            if (-not $deleted -or $deleted.Count -eq 0) { break }
-
-            foreach ($d in $deleted) {
-                # Apply date filter if set
-                if ($sinceDateFilter -and $d.DeletedOn -and $d.DeletedOn -lt $sinceDateFilter) { continue }
-                $toRestore.Add($d)
-            }
-
-            $token = $deleted[$deleted.Count - 1].ContinuationToken
-        } catch {
-            Write-RestoreLog "Error during discovery: $_" -Level ERROR
-            break
-        }
-    } while (-not [string]::IsNullOrEmpty($token))
-
-    Write-RestoreLog "Found $($toRestore.Count) items to restore"
-
-    # Restore each item
     $restored = 0
     $failed = 0
     $results = [System.Collections.Generic.List[PSCustomObject]]::new()
 
-    $i = 0
-    foreach ($item in $toRestore) {
-        $i++
-        $itemPath = $item.Path
-        $deletedOn = $item.DeletedOn
-        $deletedOnStr = if ($deletedOn) { $deletedOn.ToString('yyyy-MM-dd HH:mm:ss UTC') } else { '(unknown)' }
-        $contentLength = try { $item.ContentLength } catch { 0 }
-        if (-not $contentLength) { $contentLength = 0 }
+    if ($storageType -eq 'ADLS Gen2') {
+        # ── ADLS Gen2 restore ────────────────────────────────────────
+        $token = $null
+        $toRestore = [System.Collections.Generic.List[object]]::new()
 
-        try {
-            $null = $item | Restore-AzDataLakeGen2DeletedItem -ErrorAction Stop
-            $restored++
-            Write-RestoreLog "[$i/$($toRestore.Count)] RESTORED $itemPath" -Level SUCCESS
-            $results.Add([PSCustomObject]@{
-                StorageAccount = $name
-                FileSystem     = $acct.FileSystem
-                Path           = $itemPath
-                DeletedOn      = $deletedOnStr
-                SizeBytes      = $contentLength
-                Status         = 'Restored'
-                Error          = ''
-            })
-        } catch {
-            $failed++
-            Write-RestoreLog "[$i/$($toRestore.Count)] FAILED $itemPath — $_" -Level ERROR
-            $results.Add([PSCustomObject]@{
-                StorageAccount = $name
-                FileSystem     = $acct.FileSystem
-                Path           = $itemPath
-                DeletedOn      = $deletedOnStr
-                SizeBytes      = $contentLength
-                Status         = 'Failed'
-                Error          = $_.ToString()
-            })
+        do {
+            try {
+                $deleted = Get-AzDataLakeGen2DeletedItem -Context $ctx -FileSystem $acct.FileSystem `
+                    -Path $acct.Path -MaxCount 100 -ContinuationToken $token -ErrorAction Stop
+
+                if (-not $deleted -or $deleted.Count -eq 0) { break }
+
+                foreach ($d in $deleted) {
+                    if ($sinceDateFilter -and $d.DeletedOn -and $d.DeletedOn -lt $sinceDateFilter) { continue }
+                    $toRestore.Add($d)
+                }
+
+                $token = $deleted[$deleted.Count - 1].ContinuationToken
+            } catch {
+                Write-RestoreLog "Error during discovery: $_" -Level ERROR
+                break
+            }
+        } while (-not [string]::IsNullOrEmpty($token))
+
+        Write-RestoreLog "Found $($toRestore.Count) items to restore"
+
+        $i = 0
+        foreach ($item in $toRestore) {
+            $i++
+            $itemPath = $item.Path
+            $deletedOn = $item.DeletedOn
+            $deletedOnStr = if ($deletedOn) { $deletedOn.ToString('yyyy-MM-dd HH:mm:ss UTC') } else { '(unknown)' }
+            $contentLength = try { $item.ContentLength } catch { 0 }
+            if (-not $contentLength) { $contentLength = 0 }
+
+            try {
+                $null = $item | Restore-AzDataLakeGen2DeletedItem -ErrorAction Stop
+                $restored++
+                Write-RestoreLog "[$i/$($toRestore.Count)] RESTORED $itemPath" -Level SUCCESS
+                $results.Add([PSCustomObject]@{
+                    StorageAccount = $name
+                    StorageType    = 'ADLS Gen2'
+                    FileSystem     = $acct.FileSystem
+                    Path           = $itemPath
+                    DeletedOn      = $deletedOnStr
+                    SizeBytes      = $contentLength
+                    Status         = 'Restored'
+                    Error          = ''
+                })
+            } catch {
+                $failed++
+                Write-RestoreLog "[$i/$($toRestore.Count)] FAILED $itemPath - $_" -Level ERROR
+                $results.Add([PSCustomObject]@{
+                    StorageAccount = $name
+                    StorageType    = 'ADLS Gen2'
+                    FileSystem     = $acct.FileSystem
+                    Path           = $itemPath
+                    DeletedOn      = $deletedOnStr
+                    SizeBytes      = $contentLength
+                    Status         = 'Failed'
+                    Error          = $_.ToString()
+                })
+            }
+        }
+
+    } else {
+        # ── Blob Storage restore ─────────────────────────────────────
+        $token = $null
+        $toRestore = [System.Collections.Generic.List[object]]::new()
+
+        do {
+            try {
+                $blobParams = @{
+                    Container      = $acct.FileSystem
+                    Context        = $ctx
+                    IncludeDeleted = $true
+                    MaxCount       = 100
+                    ErrorAction    = 'Stop'
+                }
+                $pathPrefix = $acct.Path.Trim('/')
+                if ($pathPrefix -and $pathPrefix -ne '') {
+                    $blobParams['Prefix'] = $pathPrefix
+                }
+                if ($token) {
+                    $blobParams['ContinuationToken'] = $token
+                }
+
+                $blobResult = Get-AzStorageBlob @blobParams
+
+                if (-not $blobResult -or $blobResult.Count -eq 0) { break }
+
+                foreach ($blob in $blobResult) {
+                    if (-not $blob.IsDeleted) { continue }
+                    if ($sinceDateFilter -and $blob.DeletedOn -and $blob.DeletedOn -lt $sinceDateFilter) { continue }
+                    $toRestore.Add($blob)
+                }
+
+                $token = $blobResult[$blobResult.Count - 1].ContinuationToken
+            } catch {
+                Write-RestoreLog "Error during discovery: $_" -Level ERROR
+                break
+            }
+        } while (-not [string]::IsNullOrEmpty($token))
+
+        Write-RestoreLog "Found $($toRestore.Count) deleted blobs to restore"
+
+        $i = 0
+        foreach ($blob in $toRestore) {
+            $i++
+            $blobName = $blob.Name
+            $deletedOn = $blob.DeletedOn
+            $deletedOnStr = if ($deletedOn) { $deletedOn.ToString('yyyy-MM-dd HH:mm:ss UTC') } else { '(unknown)' }
+            $contentLength = try { $blob.Length } catch { 0 }
+            if (-not $contentLength) { $contentLength = 0 }
+
+            try {
+                $blob.BlobBaseClient.Undelete()
+                $restored++
+                Write-RestoreLog "[$i/$($toRestore.Count)] RESTORED $blobName" -Level SUCCESS
+                $results.Add([PSCustomObject]@{
+                    StorageAccount = $name
+                    StorageType    = 'Blob'
+                    FileSystem     = $acct.FileSystem
+                    Path           = $blobName
+                    DeletedOn      = $deletedOnStr
+                    SizeBytes      = $contentLength
+                    Status         = 'Restored'
+                    Error          = ''
+                })
+            } catch {
+                $failed++
+                Write-RestoreLog "[$i/$($toRestore.Count)] FAILED $blobName - $_" -Level ERROR
+                $results.Add([PSCustomObject]@{
+                    StorageAccount = $name
+                    StorageType    = 'Blob'
+                    FileSystem     = $acct.FileSystem
+                    Path           = $blobName
+                    DeletedOn      = $deletedOnStr
+                    SizeBytes      = $contentLength
+                    Status         = 'Failed'
+                    Error          = $_.ToString()
+                })
+            }
         }
     }
 
@@ -493,6 +683,7 @@ $restoreResults = $validAccounts | ForEach-Object -Parallel {
 
     [PSCustomObject]@{
         StorageAccount = $name
+        StorageType    = $storageType
         FileSystem     = $acct.FileSystem
         Attempted      = $toRestore.Count
         Restored       = $restored
@@ -527,7 +718,8 @@ foreach ($r in $restoreResults) {
     $grandFailed += $r.Failed
 
     $color = if ($r.Failed -gt 0) { 'Yellow' } else { 'Green' }
-    Write-Host "    $($r.StorageAccount) / $($r.FileSystem)" -ForegroundColor $color
+    $typeLabel = if ($r.StorageType) { " ($($r.StorageType))" } else { '' }
+    Write-Host "    $($r.StorageAccount) / $($r.FileSystem)$typeLabel" -ForegroundColor $color
     Write-Host "      Restored: $($r.Restored)  |  Failed: $($r.Failed)  |  Log: $($r.LogFile)"
     Write-Host ""
 }
