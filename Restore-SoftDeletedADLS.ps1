@@ -231,15 +231,21 @@ Write-Host "  Step 2: Scanning for deleted items..." -ForegroundColor Cyan
 Write-Host "  ────────────────────────────────────────────────────────────" -ForegroundColor Cyan
 Write-Host ""
 
-$allInventory = $validAccounts | ForEach-Object -Parallel {
+$progressDir = Join-Path $OutputFolder "_progress"
+if (-not (Test-Path $progressDir)) { New-Item -ItemType Directory -Path $progressDir -Force | Out-Null }
+
+$invJob = $validAccounts | ForEach-Object -Parallel {
     $acct = $_
     $sinceDateFilter = $using:sinceDateFilter
     $outputFolder = $using:OutputFolder
+    $progressDir = $using:progressDir
 
     $name = $acct.StorageAccountName
     $storageType = $acct.StorageType
-    $logFile = Join-Path $outputFolder "${name}_$($acct.FileSystem)_inventory.log"
-    $csvFile = Join-Path $outputFolder "${name}_$($acct.FileSystem)_inventory.csv"
+    $acctLabel = "${name}_$($acct.FileSystem)"
+    $logFile = Join-Path $outputFolder "${acctLabel}_inventory.log"
+    $csvFile = Join-Path $outputFolder "${acctLabel}_inventory.csv"
+    $progressFile = Join-Path $progressDir "${acctLabel}_inv.txt"
 
     Import-Module Az.Storage -MinimumVersion 4.9.0 -Force
 
@@ -290,6 +296,7 @@ $allInventory = $validAccounts | ForEach-Object -Parallel {
                     })
                 }
 
+                "scanning|$($items.Count)" | Out-File -FilePath $progressFile -Force -Encoding UTF8
                 $token = $deleted[$deleted.Count - 1].ContinuationToken
             } catch {
                 $errors += $_.ToString()
@@ -357,6 +364,7 @@ $allInventory = $validAccounts | ForEach-Object -Parallel {
                     })
                 }
 
+                "scanning|$($items.Count)" | Out-File -FilePath $progressFile -Force -Encoding UTF8
                 $token = $blobResult[$blobResult.Count - 1].ContinuationToken
             } catch {
                 $errors += $_.ToString()
@@ -364,6 +372,9 @@ $allInventory = $validAccounts | ForEach-Object -Parallel {
             }
         } while (-not [string]::IsNullOrEmpty($token))
     }
+
+    # Mark inventory complete
+    "done|$($items.Count)" | Out-File -FilePath $progressFile -Force -Encoding UTF8
 
     # Write per-account CSV
     if ($items.Count -gt 0) {
@@ -394,10 +405,51 @@ $allInventory = $validAccounts | ForEach-Object -Parallel {
         CsvFile        = $csvFile
         Items          = $items
     }
-} -ThrottleLimit 10
+} -ThrottleLimit 10 -AsJob
 
-# Handle case where ForEach-Object -Parallel returns a single object (not array)
-$allInventory = @($allInventory)
+# Poll inventory progress
+$completedAccounts = @{}
+while ($invJob.State -eq 'Running') {
+    foreach ($acct in $validAccounts) {
+        $acctLabel = "$($acct.StorageAccountName)_$($acct.FileSystem)"
+        if ($completedAccounts[$acctLabel]) { continue }
+        $pFile = Join-Path $progressDir "${acctLabel}_inv.txt"
+        if (Test-Path $pFile) {
+            $pContent = (Get-Content $pFile -Raw -ErrorAction SilentlyContinue)
+            if ($pContent) {
+                $parts = $pContent.Trim() -split '\|'
+                $status = $parts[0]
+                $count = if ($parts.Count -gt 1) { $parts[1] } else { '0' }
+                if ($status -eq 'done') {
+                    $completedAccounts[$acctLabel] = $true
+                    Write-Host "    [DONE] $($acct.StorageAccountName) / $($acct.FileSystem) — $count items found" -ForegroundColor Green
+                }
+            }
+        }
+    }
+    $doneCount = $completedAccounts.Count
+    $pct = if ($validAccounts.Count -gt 0) { [math]::Round(($doneCount / $validAccounts.Count) * 100) } else { 0 }
+    Write-Progress -Activity "Scanning for deleted items" -Status "$doneCount of $($validAccounts.Count) accounts scanned ($pct%)" -PercentComplete $pct
+    Start-Sleep -Milliseconds 500
+}
+
+# Show any remaining completions
+foreach ($acct in $validAccounts) {
+    $acctLabel = "$($acct.StorageAccountName)_$($acct.FileSystem)"
+    if ($completedAccounts[$acctLabel]) { continue }
+    $pFile = Join-Path $progressDir "${acctLabel}_inv.txt"
+    if (Test-Path $pFile) {
+        $pContent = (Get-Content $pFile -Raw -ErrorAction SilentlyContinue)
+        if ($pContent) {
+            $parts = $pContent.Trim() -split '\|'
+            $count = if ($parts.Count -gt 1) { $parts[1] } else { '0' }
+            Write-Host "    [DONE] $($acct.StorageAccountName) / $($acct.FileSystem) — $count items found" -ForegroundColor Green
+        }
+    }
+}
+
+Write-Progress -Activity "Scanning for deleted items" -Completed
+$allInventory = @($invJob | Receive-Job -Wait -AutoRemoveJob)
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  INVENTORY RESULTS
@@ -502,15 +554,18 @@ Write-Host "  Step 4: Restoring deleted items..." -ForegroundColor Cyan
 Write-Host "  ────────────────────────────────────────────────────────────" -ForegroundColor Cyan
 Write-Host ""
 
-$restoreResults = $validAccounts | ForEach-Object -Parallel {
+$restoreJob = $validAccounts | ForEach-Object -Parallel {
     $acct = $_
     $sinceDateFilter = $using:sinceDateFilter
     $outputFolder = $using:OutputFolder
+    $progressDir = $using:progressDir
 
     $name = $acct.StorageAccountName
     $storageType = $acct.StorageType
-    $logFile = Join-Path $outputFolder "${name}_$($acct.FileSystem)_restore.log"
-    $csvFile = Join-Path $outputFolder "${name}_$($acct.FileSystem)_restore.csv"
+    $acctLabel = "${name}_$($acct.FileSystem)"
+    $logFile = Join-Path $outputFolder "${acctLabel}_restore.log"
+    $csvFile = Join-Path $outputFolder "${acctLabel}_restore.csv"
+    $progressFile = Join-Path $progressDir "${acctLabel}_restore.txt"
 
     Import-Module Az.Storage -MinimumVersion 4.9.0 -Force
 
@@ -553,6 +608,8 @@ $restoreResults = $validAccounts | ForEach-Object -Parallel {
         } while (-not [string]::IsNullOrEmpty($token))
 
         Write-RestoreLog "Found $($toRestore.Count) items to restore"
+        $totalToRestore = $toRestore.Count
+        "restoring|0|$totalToRestore" | Out-File -FilePath $progressFile -Force -Encoding UTF8
 
         $i = 0
         foreach ($item in $toRestore) {
@@ -591,6 +648,7 @@ $restoreResults = $validAccounts | ForEach-Object -Parallel {
                     Error          = $_.ToString()
                 })
             }
+            "restoring|$i|$totalToRestore" | Out-File -FilePath $progressFile -Force -Encoding UTF8
         }
 
     } else {
@@ -633,6 +691,8 @@ $restoreResults = $validAccounts | ForEach-Object -Parallel {
         } while (-not [string]::IsNullOrEmpty($token))
 
         Write-RestoreLog "Found $($toRestore.Count) deleted blobs to restore"
+        $totalToRestore = $toRestore.Count
+        "restoring|0|$totalToRestore" | Out-File -FilePath $progressFile -Force -Encoding UTF8
 
         $i = 0
         foreach ($blob in $toRestore) {
@@ -671,8 +731,12 @@ $restoreResults = $validAccounts | ForEach-Object -Parallel {
                     Error          = $_.ToString()
                 })
             }
+            "restoring|$i|$totalToRestore" | Out-File -FilePath $progressFile -Force -Encoding UTF8
         }
     }
+
+    # Mark restore complete
+    "done|$restored|$failed" | Out-File -FilePath $progressFile -Force -Encoding UTF8
 
     # Write restore CSV
     if ($results.Count -gt 0) {
@@ -691,9 +755,78 @@ $restoreResults = $validAccounts | ForEach-Object -Parallel {
         LogFile        = $logFile
         CsvFile        = $csvFile
     }
-} -ThrottleLimit 10
+} -ThrottleLimit 10 -AsJob
 
-$restoreResults = @($restoreResults)
+# Poll restore progress
+$completedRestores = @{}
+while ($restoreJob.State -eq 'Running') {
+    $grandDone = 0
+    $grandTotal = 0
+    foreach ($acct in $validAccounts) {
+        $acctLabel = "$($acct.StorageAccountName)_$($acct.FileSystem)"
+        $pFile = Join-Path $progressDir "${acctLabel}_restore.txt"
+        if (Test-Path $pFile) {
+            $pContent = (Get-Content $pFile -Raw -ErrorAction SilentlyContinue)
+            if ($pContent) {
+                $parts = $pContent.Trim() -split '\|'
+                $status = $parts[0]
+                if ($status -eq 'done' -and -not $completedRestores[$acctLabel]) {
+                    $completedRestores[$acctLabel] = $true
+                    $doneRestored = if ($parts.Count -gt 1) { $parts[1] } else { '0' }
+                    $doneFailed = if ($parts.Count -gt 2) { $parts[2] } else { '0' }
+                    $color = if ([int]$doneFailed -gt 0) { 'Yellow' } else { 'Green' }
+                    Write-Host "    [DONE] $($acct.StorageAccountName) / $($acct.FileSystem) — $doneRestored restored, $doneFailed failed" -ForegroundColor $color
+                } elseif ($status -eq 'restoring') {
+                    $current = if ($parts.Count -gt 1) { [int]$parts[1] } else { 0 }
+                    $total = if ($parts.Count -gt 2) { [int]$parts[2] } else { 0 }
+                    $grandDone += $current
+                    $grandTotal += $total
+                }
+            }
+        }
+    }
+    # Add completed accounts to totals
+    foreach ($acct in $validAccounts) {
+        $acctLabel = "$($acct.StorageAccountName)_$($acct.FileSystem)"
+        if ($completedRestores[$acctLabel]) {
+            $pFile = Join-Path $progressDir "${acctLabel}_restore.txt"
+            $pContent = (Get-Content $pFile -Raw -ErrorAction SilentlyContinue)
+            if ($pContent) {
+                $parts = $pContent.Trim() -split '\|'
+                $doneR = if ($parts.Count -gt 1) { [int]$parts[1] } else { 0 }
+                $doneF = if ($parts.Count -gt 2) { [int]$parts[2] } else { 0 }
+                $grandDone += ($doneR + $doneF)
+                $grandTotal += ($doneR + $doneF)
+            }
+        }
+    }
+    $pct = if ($grandTotal -gt 0) { [math]::Min(100, [math]::Round(($grandDone / $grandTotal) * 100)) } else { 0 }
+    Write-Progress -Activity "Restoring deleted items" -Status "$grandDone of $grandTotal items ($pct%)" -PercentComplete $pct
+    Start-Sleep -Milliseconds 500
+}
+
+# Show any remaining completions
+foreach ($acct in $validAccounts) {
+    $acctLabel = "$($acct.StorageAccountName)_$($acct.FileSystem)"
+    if ($completedRestores[$acctLabel]) { continue }
+    $pFile = Join-Path $progressDir "${acctLabel}_restore.txt"
+    if (Test-Path $pFile) {
+        $pContent = (Get-Content $pFile -Raw -ErrorAction SilentlyContinue)
+        if ($pContent) {
+            $parts = $pContent.Trim() -split '\|'
+            $doneRestored = if ($parts.Count -gt 1) { $parts[1] } else { '0' }
+            $doneFailed = if ($parts.Count -gt 2) { $parts[2] } else { '0' }
+            $color = if ([int]$doneFailed -gt 0) { 'Yellow' } else { 'Green' }
+            Write-Host "    [DONE] $($acct.StorageAccountName) / $($acct.FileSystem) — $doneRestored restored, $doneFailed failed" -ForegroundColor $color
+        }
+    }
+}
+
+Write-Progress -Activity "Restoring deleted items" -Completed
+$restoreResults = @($restoreJob | Receive-Job -Wait -AutoRemoveJob)
+
+# Clean up progress files
+Remove-Item -Path $progressDir -Recurse -Force -ErrorAction SilentlyContinue
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  FINAL SUMMARY
