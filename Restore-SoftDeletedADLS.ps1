@@ -281,33 +281,37 @@ $invJob = $validAccounts | ForEach-Object -Parallel {
                 if (-not $deleted -or $deleted.Count -eq 0) { break }
 
                 foreach ($d in $deleted) {
-                    $deletedOn = $d.DeletedOn
-                    if ($sinceDateFilter -and $deletedOn -and $deletedOn -lt $sinceDateFilter) { continue }
-                    if ($beforeDateFilter -and $deletedOn -and $deletedOn -ge $beforeDateFilter) { continue }
-                    $deletedOnStr = if ($deletedOn) { $deletedOn.ToString('yyyy-MM-dd HH:mm:ss UTC') } else { '(unknown)' }
-                    $remainingDays = ''
-                    $urgency = 'UNKNOWN'
-                    if ($retentionDaysNum) {
-                        $remainingDays = $retentionDaysNum
-                        $urgency = if ($retentionDaysNum -le 3) { 'CRITICAL' } elseif ($retentionDaysNum -le 7) { 'WARNING' } else { 'OK' }
-                    } elseif ($deletedOn) {
-                        $daysSince = [math]::Floor(((Get-Date -AsUTC) - $deletedOn).TotalDays)
-                        $remainingDays = "(deleted ${daysSince}d ago)"
-                    }
+                    try {
+                        $deletedOn = $d.DeletedOn
+                        if ($sinceDateFilter -and $deletedOn -and $deletedOn -lt $sinceDateFilter) { continue }
+                        if ($beforeDateFilter -and $deletedOn -and $deletedOn -ge $beforeDateFilter) { continue }
+                        $deletedOnStr = if ($deletedOn) { $deletedOn.UtcDateTime.ToString('yyyy-MM-dd HH:mm:ss UTC') } else { '(unknown)' }
+                        $remainingDays = ''
+                        $urgency = 'UNKNOWN'
+                        if ($retentionDaysNum) {
+                            $remainingDays = $retentionDaysNum
+                            $urgency = if ($retentionDaysNum -le 3) { 'CRITICAL' } elseif ($retentionDaysNum -le 7) { 'WARNING' } else { 'OK' }
+                        } elseif ($deletedOn) {
+                            $daysSince = [math]::Floor(([DateTimeOffset]::UtcNow - $deletedOn).TotalDays)
+                            $remainingDays = "(deleted ${daysSince}d ago)"
+                        }
 
-                    $items.Add([PSCustomObject]@{
-                        StorageAccount   = $name
-                        StorageType      = 'ADLS Gen2'
-                        FileSystem       = $acct.FileSystem
-                        Path             = $d.Path
-                        IsDirectory      = if ($d.IsDirectory) { $true } else { $false }
-                        ItemType         = if ($d.Path -match '_delta_log') { '_delta_log' } else { 'data' }
-                        DeletedOn        = $deletedOnStr
-                        RemainingDays    = $remainingDays
-                        RetentionUrgency = $urgency
-                        SizeBytes        = $contentLength
-                        DeletionId       = try { $d.DeletionId } catch { '' }
-                    })
+                        $items.Add([PSCustomObject]@{
+                            StorageAccount   = $name
+                            StorageType      = 'ADLS Gen2'
+                            FileSystem       = $acct.FileSystem
+                            Path             = $d.Path
+                            IsDirectory      = if ($d.IsDirectory) { $true } else { $false }
+                            ItemType         = if ($d.Path -match '_delta_log') { '_delta_log' } else { 'data' }
+                            DeletedOn        = $deletedOnStr
+                            RemainingDays    = $remainingDays
+                            RetentionUrgency = $urgency
+                            SizeBytes        = $contentLength
+                            DeletionId       = try { $d.DeletionId } catch { '' }
+                        })
+                    } catch {
+                        $errors += "Item error on $($d.Path): $_"
+                    }
                 }
 
                 "scanning|$($items.Count)" | Out-File -FilePath $progressFile -Force -Encoding UTF8
@@ -347,37 +351,41 @@ $invJob = $validAccounts | ForEach-Object -Parallel {
                     # Only process deleted blobs
                     if (-not $blob.IsDeleted) { continue }
 
-                    $deletedOn = $blob.DeletedOn
-                    if ($sinceDateFilter -and $deletedOn -and $deletedOn -lt $sinceDateFilter) { continue }
-                    if ($beforeDateFilter -and $deletedOn -and $deletedOn -ge $beforeDateFilter) { continue }
-                    $deletedOnStr = if ($deletedOn) { $deletedOn.ToString('yyyy-MM-dd HH:mm:ss UTC') } else { '(unknown)' }
-                    $contentLength = try { $blob.Length } catch { 0 }
-                    if (-not $contentLength) { $contentLength = 0 }
+                    try {
+                        $deletedOn = $blob.DeletedOn
+                        if ($sinceDateFilter -and $deletedOn -and $deletedOn -lt $sinceDateFilter) { continue }
+                        if ($beforeDateFilter -and $deletedOn -and $deletedOn -ge $beforeDateFilter) { continue }
+                        $deletedOnStr = if ($deletedOn) { $deletedOn.UtcDateTime.ToString('yyyy-MM-dd HH:mm:ss UTC') } else { '(unknown)' }
+                        $contentLength = try { $blob.Length } catch { 0 }
+                        if (-not $contentLength) { $contentLength = 0 }
 
-                    $retentionDaysNum = try { $blob.RemainingDaysBeforePermanentDelete } catch { $null }
-                    $remainingDays = ''
-                    $urgency = 'UNKNOWN'
-                    if ($retentionDaysNum) {
-                        $remainingDays = $retentionDaysNum
-                        $urgency = if ($retentionDaysNum -le 3) { 'CRITICAL' } elseif ($retentionDaysNum -le 7) { 'WARNING' } else { 'OK' }
-                    } elseif ($deletedOn) {
-                        $daysSince = [math]::Floor(((Get-Date -AsUTC) - $deletedOn).TotalDays)
-                        $remainingDays = "(deleted ${daysSince}d ago)"
+                        $retentionDaysNum = try { $blob.RemainingDaysBeforePermanentDelete } catch { $null }
+                        $remainingDays = ''
+                        $urgency = 'UNKNOWN'
+                        if ($retentionDaysNum) {
+                            $remainingDays = $retentionDaysNum
+                            $urgency = if ($retentionDaysNum -le 3) { 'CRITICAL' } elseif ($retentionDaysNum -le 7) { 'WARNING' } else { 'OK' }
+                        } elseif ($deletedOn) {
+                            $daysSince = [math]::Floor(([DateTimeOffset]::UtcNow - $deletedOn).TotalDays)
+                            $remainingDays = "(deleted ${daysSince}d ago)"
+                        }
+
+                        $items.Add([PSCustomObject]@{
+                            StorageAccount   = $name
+                            StorageType      = 'Blob'
+                            FileSystem       = $acct.FileSystem
+                            Path             = $blob.Name
+                            IsDirectory      = $false
+                            ItemType         = if ($blob.Name -match '_delta_log') { '_delta_log' } else { 'data' }
+                            DeletedOn        = $deletedOnStr
+                            RemainingDays    = $remainingDays
+                            RetentionUrgency = $urgency
+                            SizeBytes        = $contentLength
+                            DeletionId       = ''
+                        })
+                    } catch {
+                        $errors += "Item error on $($blob.Name): $_"
                     }
-
-                    $items.Add([PSCustomObject]@{
-                        StorageAccount   = $name
-                        StorageType      = 'Blob'
-                        FileSystem       = $acct.FileSystem
-                        Path             = $blob.Name
-                        IsDirectory      = $false
-                        ItemType         = if ($blob.Name -match '_delta_log') { '_delta_log' } else { 'data' }
-                        DeletedOn        = $deletedOnStr
-                        RemainingDays    = $remainingDays
-                        RetentionUrgency = $urgency
-                        SizeBytes        = $contentLength
-                        DeletionId       = ''
-                    })
                 }
 
                 "scanning|$($items.Count)" | Out-File -FilePath $progressFile -Force -Encoding UTF8
@@ -634,7 +642,7 @@ $restoreJob = $validAccounts | ForEach-Object -Parallel {
             $i++
             $itemPath = $item.Path
             $deletedOn = $item.DeletedOn
-            $deletedOnStr = if ($deletedOn) { $deletedOn.ToString('yyyy-MM-dd HH:mm:ss UTC') } else { '(unknown)' }
+            $deletedOnStr = if ($deletedOn) { $deletedOn.UtcDateTime.ToString('yyyy-MM-dd HH:mm:ss UTC') } else { '(unknown)' }
             $contentLength = try { $item.ContentLength } catch { 0 }
             if (-not $contentLength) { $contentLength = 0 }
 
@@ -718,7 +726,7 @@ $restoreJob = $validAccounts | ForEach-Object -Parallel {
             $i++
             $blobName = $blob.Name
             $deletedOn = $blob.DeletedOn
-            $deletedOnStr = if ($deletedOn) { $deletedOn.ToString('yyyy-MM-dd HH:mm:ss UTC') } else { '(unknown)' }
+            $deletedOnStr = if ($deletedOn) { $deletedOn.UtcDateTime.ToString('yyyy-MM-dd HH:mm:ss UTC') } else { '(unknown)' }
             $contentLength = try { $blob.Length } catch { 0 }
             if (-not $contentLength) { $contentLength = 0 }
 
