@@ -292,7 +292,7 @@ $invJob = $validAccounts | ForEach-Object -Parallel {
                             $remainingDays = $retentionDaysNum
                             $urgency = if ($retentionDaysNum -le 3) { 'CRITICAL' } elseif ($retentionDaysNum -le 7) { 'WARNING' } else { 'OK' }
                         } elseif ($deletedOn) {
-                            $daysSince = [math]::Floor(([DateTimeOffset]::UtcNow - $deletedOn).TotalDays)
+                            $daysSince = [math]::Floor(([DateTimeOffset]::UtcNow - ([DateTimeOffset]$deletedOn)).TotalDays)
                             $remainingDays = "(deleted ${daysSince}d ago)"
                         }
 
@@ -366,7 +366,7 @@ $invJob = $validAccounts | ForEach-Object -Parallel {
                             $remainingDays = $retentionDaysNum
                             $urgency = if ($retentionDaysNum -le 3) { 'CRITICAL' } elseif ($retentionDaysNum -le 7) { 'WARNING' } else { 'OK' }
                         } elseif ($deletedOn) {
-                            $daysSince = [math]::Floor(([DateTimeOffset]::UtcNow - $deletedOn).TotalDays)
+                            $daysSince = [math]::Floor(([DateTimeOffset]::UtcNow - ([DateTimeOffset]$deletedOn)).TotalDays)
                             $remainingDays = "(deleted ${daysSince}d ago)"
                         }
 
