@@ -131,6 +131,21 @@ if ($SinceDate -and $SinceDate -ne '') {
     }
 }
 
+$beforeDateFilter = $null
+if ($BeforeDate -and $BeforeDate -ne '') {
+    try {
+        # Set to end of day so "before 2026-03-20" includes the entire day
+        $beforeDateFilter = [DateTime]::Parse($BeforeDate).ToUniversalTime().Date.AddDays(1)
+        Write-Host "  [OK] Date filter: items deleted on or before $([DateTime]::Parse($BeforeDate).ToString('yyyy-MM-dd'))" -ForegroundColor Green
+    } catch {
+        Write-Host "  [WARN] Could not parse BeforeDate '$BeforeDate' — ignoring" -ForegroundColor Yellow
+    }
+}
+
+if ($sinceDateFilter -and $beforeDateFilter -and $sinceDateFilter -ge $beforeDateFilter) {
+    Write-Host "  [WARN] SinceDate is after BeforeDate — date range is empty, no items will match" -ForegroundColor Yellow
+}
+
 # Setup output folder
 if (-not $OutputFolder -or $OutputFolder -eq '') {
     $OutputFolder = Join-Path $scriptDir "ADLSRecovery_$($startTime.ToString('yyyyMMdd_HHmmss'))"
@@ -237,6 +252,7 @@ if (-not (Test-Path $progressDir)) { New-Item -ItemType Directory -Path $progres
 $invJob = $validAccounts | ForEach-Object -Parallel {
     $acct = $_
     $sinceDateFilter = $using:sinceDateFilter
+    $beforeDateFilter = $using:beforeDateFilter
     $outputFolder = $using:OutputFolder
     $progressDir = $using:progressDir
 
@@ -266,11 +282,9 @@ $invJob = $validAccounts | ForEach-Object -Parallel {
 
                 foreach ($d in $deleted) {
                     $deletedOn = $d.DeletedOn
+                    if ($sinceDateFilter -and $deletedOn -and $deletedOn -lt $sinceDateFilter) { continue }
+                    if ($beforeDateFilter -and $deletedOn -and $deletedOn -ge $beforeDateFilter) { continue }
                     $deletedOnStr = if ($deletedOn) { $deletedOn.ToString('yyyy-MM-dd HH:mm:ss UTC') } else { '(unknown)' }
-                    $contentLength = try { $d.ContentLength } catch { 0 }
-                    if (-not $contentLength) { $contentLength = 0 }
-
-                    $retentionDaysNum = try { $d.RemainingRetentionDays } catch { $null }
                     $remainingDays = ''
                     $urgency = 'UNKNOWN'
                     if ($retentionDaysNum) {
@@ -334,6 +348,8 @@ $invJob = $validAccounts | ForEach-Object -Parallel {
                     if (-not $blob.IsDeleted) { continue }
 
                     $deletedOn = $blob.DeletedOn
+                    if ($sinceDateFilter -and $deletedOn -and $deletedOn -lt $sinceDateFilter) { continue }
+                    if ($beforeDateFilter -and $deletedOn -and $deletedOn -ge $beforeDateFilter) { continue }
                     $deletedOnStr = if ($deletedOn) { $deletedOn.ToString('yyyy-MM-dd HH:mm:ss UTC') } else { '(unknown)' }
                     $contentLength = try { $blob.Length } catch { 0 }
                     if (-not $contentLength) { $contentLength = 0 }
@@ -557,6 +573,7 @@ Write-Host ""
 $restoreJob = $validAccounts | ForEach-Object -Parallel {
     $acct = $_
     $sinceDateFilter = $using:sinceDateFilter
+    $beforeDateFilter = $using:beforeDateFilter
     $outputFolder = $using:OutputFolder
     $progressDir = $using:progressDir
 
@@ -597,6 +614,7 @@ $restoreJob = $validAccounts | ForEach-Object -Parallel {
 
                 foreach ($d in $deleted) {
                     if ($sinceDateFilter -and $d.DeletedOn -and $d.DeletedOn -lt $sinceDateFilter) { continue }
+                    if ($beforeDateFilter -and $d.DeletedOn -and $d.DeletedOn -ge $beforeDateFilter) { continue }
                     $toRestore.Add($d)
                 }
 
@@ -680,6 +698,7 @@ $restoreJob = $validAccounts | ForEach-Object -Parallel {
                 foreach ($blob in $blobResult) {
                     if (-not $blob.IsDeleted) { continue }
                     if ($sinceDateFilter -and $blob.DeletedOn -and $blob.DeletedOn -lt $sinceDateFilter) { continue }
+                    if ($beforeDateFilter -and $blob.DeletedOn -and $blob.DeletedOn -ge $beforeDateFilter) { continue }
                     $toRestore.Add($blob)
                 }
 

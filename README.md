@@ -113,6 +113,9 @@ In `ADLSRestore-Config.ps1`, you can optionally set:
 # Only recover items deleted on or after this date
 $SinceDate = "2026-03-15"
 
+# Only recover items deleted on or before this date (use with $SinceDate for a date range)
+$BeforeDate = "2026-03-20"
+
 # Custom output folder for logs/CSVs
 $OutputFolder = "C:\Recovery\Output"
 ```

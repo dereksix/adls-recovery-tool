@@ -70,5 +70,11 @@ $Accounts = @(
 # Examples: "2026-03-15", "2026-01-01"
 $SinceDate = ""
 
+# Only recover items deleted on or before this date.
+# Use together with $SinceDate to define a date range.
+# Leave blank for no upper bound.
+# Examples: "2026-03-20", "2026-03-31"
+$BeforeDate = ""
+
 # Where to save log and CSV files. Default: same folder as the script.
 $OutputFolder = ""
