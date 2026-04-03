@@ -286,6 +286,9 @@ $invJob = $validAccounts | ForEach-Object -Parallel {
                         if ($sinceDateFilter -and $deletedOn -and $deletedOn -lt $sinceDateFilter) { continue }
                         if ($beforeDateFilter -and $deletedOn -and $deletedOn -ge $beforeDateFilter) { continue }
                         $deletedOnStr = if ($deletedOn) { $deletedOn.UtcDateTime.ToString('yyyy-MM-dd HH:mm:ss UTC') } else { '(unknown)' }
+                        $contentLength = try { $d.ContentLength } catch { 0 }
+                        if (-not $contentLength) { $contentLength = 0 }
+                        $retentionDaysNum = try { $d.RemainingDaysBeforePermanentDelete } catch { $null }
                         $remainingDays = ''
                         $urgency = 'UNKNOWN'
                         if ($retentionDaysNum) {
