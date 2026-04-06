@@ -6,14 +6,15 @@ A production-ready PowerShell utility for recovering soft-deleted files from Azu
 
 This tool is based on the soft-delete recovery approach documented in [Microsoft's official Azure documentation](https://learn.microsoft.com/en-us/azure/storage/blobs/soft-delete-blob-manage?tabs=dotnet), which provides reference-level code samples showing the relevant cmdlets and API calls. However, those examples are intended to demonstrate the API surface — not to be run in production. They lack pagination, error handling, multi-account support, progress tracking, and logging.
 
-This project takes the core concepts from the Microsoft docs and builds them into a robust, customer-facing recovery tool that handles real-world scenarios: thousands of files, multiple storage accounts, retention tracking, parallel execution, and full audit trails.
+This project takes the core concepts from the Microsoft docs and builds them into a robust, customer-facing recovery tool that handles real-world scenarios: millions of files, multiple storage accounts, retention tracking, parallel execution with adaptive throttling, and full audit trails.
 
 ## What It Does
 
 - **Auto-detects** storage type (ADLS Gen2 vs Blob Storage) per account — no need to know which you have
 - **Scans** all configured storage accounts in parallel for soft-deleted items
 - **Reports** an inventory with retention status (critical/warning/OK), item counts, sizes, and deletion timeline
-- **Restores** all recoverable items with per-item error handling — one failure doesn't stop the rest
+- **Restores** items in parallel with configurable concurrency, rate limiting, and adaptive throttling
+- **Resumes** interrupted runs — re-running the script skips already-restored items automatically
 - **Logs** everything to per-account log files and CSV reports for audit trails and post-mortems
 - **Auto-installs** the required Az.Storage module if it's missing or outdated
 
@@ -23,7 +24,7 @@ The entire workflow is interactive — no flags or parameters to remember:
 Step 1: Test connections and detect storage type (ADLS Gen2 or Blob)
 Step 2: Scan and inventory all deleted items (parallel)
 Step 3: Review results, confirm Y/N
-Step 4: Restore everything (parallel)
+Step 4: Restore everything (parallel, rate-limited, adaptive throttle)
 Step 5: Final summary with per-account success/fail counts
 ```
 
@@ -82,7 +83,7 @@ The script will:
 2. Test connections and auto-detect each account's storage type
 3. Scan all accounts in parallel and show what was deleted
 4. Ask you to confirm before restoring
-5. Restore everything in parallel and show a final summary
+5. Restore in parallel with rate limiting and show a final summary
 
 ### 4. Review
 
@@ -105,32 +106,69 @@ ADLSRecovery_20260402_143022/
 
 The script auto-detects which type each account is at connection time — you don't need to know or specify it.
 
-## Optional Settings
+## Performance & Parallelism
 
-In `ADLSRestore-Config.ps1`, you can optionally set:
+The restore phase runs multiple operations concurrently with three layers of protection to avoid overwhelming Azure:
+
+| Layer | What It Does |
+|---|---|
+| **Hard RPS cap** | `$MaxRequestsPerSecond` (default 500, max 2000) enforces a per-worker delay floor so total throughput can't exceed the configured ceiling |
+| **Adaptive throttle** | When any worker receives a 429 (throttled), all workers see a shared signal and back off proportionally. Pressure decays after 30 seconds of clean runs. |
+| **Per-retry backoff** | Individual 429/503 errors get exponential backoff (2s → 4s → 8s…) with random jitter |
+
+### Expected throughput
+
+| Scale | Enumeration | Restore (64 workers) |
+|---|---|---|
+| 10,000 items | ~5 seconds | ~3 minutes |
+| 100,000 items | ~30 seconds | ~30 minutes |
+| 1,000,000 items | ~5 minutes | ~5 hours |
+| 5,000,000+ items | ~15 minutes | ~24 hours |
+
+> **Note:** Actual speeds depend on API latency, account load, and throttling. The progress bar shows real-time rate, ETA, and throttle count so you can monitor and adjust.
+
+### Resume support
+
+If a run is interrupted (Ctrl+C, network drop, etc.), simply re-run the script with the same output folder. It reads the existing log file and skips any items already successfully restored.
+
+## Configuration Reference
+
+All settings are in `ADLSRestore-Config.ps1`:
 
 ```powershell
-# Only recover items deleted on or after this date
-$SinceDate = "2026-03-15"
+# ── Storage accounts ──────────────────────────────────────────────
+$Accounts = @(
+    @{
+        StorageAccountName = ""
+        StorageAccountKey  = ""
+        FileSystem         = ""
+        Path               = ""
+    }
+)
 
-# Only recover items deleted on or before this date (use with $SinceDate for a date range)
-$BeforeDate = "2026-03-20"
+# ── Date filters (optional) ──────────────────────────────────────
+$SinceDate  = ""          # e.g. "2026-03-15" — only items deleted on/after
+$BeforeDate = ""          # e.g. "2026-03-20" — only items deleted on/before
 
-# Custom output folder for logs/CSVs
-$OutputFolder = "C:\Recovery\Output"
+# ── Output ────────────────────────────────────────────────────────
+$OutputFolder = ""        # defaults to script folder
+
+# ── Parallelism ───────────────────────────────────────────────────
+$MaxConcurrency = 64      # parallel workers per account (max 256)
+$MaxRequestsPerSecond = 500  # hard RPS ceiling (max 2000)
+$MaxRetries = 3           # retries per item on 429/503 errors
 ```
 
-## Performance
+### Tuning guide
 
-The bottleneck is Azure API call latency (~200-500ms per call), not the script:
-
-| Operation | Speed |
+| Scenario | Recommended Settings |
 |---|---|
-| **Inventory** | ~100 items/second (batched 100 per API call) |
-| **Restore** | ~2-5 items/second (1 API call per item) |
-| **Parallelism** | All accounts run simultaneously — total time = slowest single account |
+| **Small restore** (<10K items) | Defaults are fine |
+| **Large restore** (100K–1M items) | `$MaxConcurrency = 64`, `$MaxRequestsPerSecond = 500` |
+| **Very large restore** (1M+ items) | `$MaxConcurrency = 128`, `$MaxRequestsPerSecond = 1000` — monitor for throttling |
+| **Shared production account** | Start conservative: `$MaxConcurrency = 32`, `$MaxRequestsPerSecond = 200` — increase if no throttle hits shown in progress bar |
 
-For 10,000 files across multiple accounts, expect ~1-2 minutes for inventory and ~30-80 minutes for restore.
+> ⚠️ **Always monitor the Azure portal** (Storage Account > Metrics > Transactions / Throttling errors) during large restores on production accounts.
 
 ## Common Issues
 
