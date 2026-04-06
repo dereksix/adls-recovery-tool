@@ -28,7 +28,7 @@
 $ErrorActionPreference = "Stop"
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
 $startTime = Get-Date -AsUTC
-$scriptVersion = "5.0.0"
+$scriptVersion = "6.0.0"
 
 function Format-Size([long]$bytes) {
     if ($bytes -ge 1GB) { return "{0:N2} GB" -f ($bytes / 1GB) }
@@ -154,6 +154,16 @@ if (-not (Test-Path $OutputFolder)) {
     New-Item -ItemType Directory -Path $OutputFolder -Force | Out-Null
 }
 
+# Parse parallelism settings (with hard caps)
+if (-not $MaxConcurrency -or $MaxConcurrency -lt 1) { $MaxConcurrency = 64 }
+$MaxConcurrency = [math]::Min($MaxConcurrency, 256)
+if (-not $MaxRequestsPerSecond -or $MaxRequestsPerSecond -lt 1) { $MaxRequestsPerSecond = 500 }
+$MaxRequestsPerSecond = [math]::Min($MaxRequestsPerSecond, 2000)
+if (-not $MaxRetries -or $MaxRetries -lt 0) { $MaxRetries = 3 }
+# Per-worker minimum delay (ms) to enforce the RPS ceiling
+$script:WorkerDelayMs = [math]::Max(0, [math]::Ceiling(($MaxConcurrency / $MaxRequestsPerSecond) * 1000))
+Write-Host "  [OK] Parallelism: $MaxConcurrency workers, ${MaxRequestsPerSecond} req/sec cap, $MaxRetries retries" -ForegroundColor Green
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  SHOW CONFIGURED ACCOUNTS
 # ══════════════════════════════════════════════════════════════════════════════
@@ -276,7 +286,7 @@ $invJob = $validAccounts | ForEach-Object -Parallel {
         do {
             try {
                 $deleted = Get-AzDataLakeGen2DeletedItem -Context $ctx -FileSystem $acct.FileSystem `
-                    -Path $acct.Path -MaxCount 100 -ContinuationToken $token -ErrorAction Stop
+                    -Path $acct.Path -MaxCount 5000 -ContinuationToken $token -ErrorAction Stop
 
                 if (-not $deleted -or $deleted.Count -eq 0) { break }
 
@@ -334,7 +344,7 @@ $invJob = $validAccounts | ForEach-Object -Parallel {
                     Container         = $acct.FileSystem
                     Context           = $ctx
                     IncludeDeleted    = $true
-                    MaxCount          = 100
+                    MaxCount          = 5000
                     ErrorAction       = 'Stop'
                 }
                 # Scope to prefix if path is not root
@@ -572,288 +582,380 @@ if ($choice -eq 'N') {
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  STEP 4 — RESTORE (parallel across accounts)
+#  STEP 4 — RESTORE (parallel within each account)
 # ══════════════════════════════════════════════════════════════════════════════
 
 Write-Host ""
 Write-Host "  ────────────────────────────────────────────────────────────" -ForegroundColor Cyan
-Write-Host "  Step 4: Restoring deleted items..." -ForegroundColor Cyan
+Write-Host "  Step 4: Restoring deleted items ($MaxConcurrency parallel)..." -ForegroundColor Cyan
 Write-Host "  ────────────────────────────────────────────────────────────" -ForegroundColor Cyan
 Write-Host ""
 
-$restoreJob = $validAccounts | ForEach-Object -Parallel {
-    $acct = $_
-    $sinceDateFilter = $using:sinceDateFilter
-    $beforeDateFilter = $using:beforeDateFilter
-    $outputFolder = $using:OutputFolder
-    $progressDir = $using:progressDir
+$restoreResults = @()
 
-    $name = $acct.StorageAccountName
+foreach ($acct in $validAccounts) {
+    $acctName   = $acct.StorageAccountName
+    $acctKey    = $acct.StorageAccountKey
     $storageType = $acct.StorageType
-    $acctLabel = "${name}_$($acct.FileSystem)"
-    $logFile = Join-Path $outputFolder "${acctLabel}_restore.log"
-    $csvFile = Join-Path $outputFolder "${acctLabel}_restore.csv"
-    $progressFile = Join-Path $progressDir "${acctLabel}_restore.txt"
+    $fileSystem = $acct.FileSystem
+    $acctLabel  = "${acctName}_${fileSystem}"
+    $logFile    = Join-Path $OutputFolder "${acctLabel}_restore.log"
+    $csvFile    = Join-Path $OutputFolder "${acctLabel}_restore.csv"
 
-    Import-Module Az.Storage -MinimumVersion 4.9.0 -Force
-
-    function Write-RestoreLog {
-        param([string]$Message, [string]$Level = 'INFO')
+    function Write-RestoreLog([string]$Message, [string]$Level = 'INFO') {
         $ts = (Get-Date -AsUTC).ToString('yyyy-MM-dd HH:mm:ss.fff')
-        $entry = "[$ts UTC] [$Level] $Message"
-        $entry | Out-File -FilePath $logFile -Append -Encoding UTF8
+        "[$ts UTC] [$Level] $Message" | Out-File -FilePath $logFile -Append -Encoding UTF8
     }
 
-    $ctx = New-AzStorageContext -StorageAccountName $name -StorageAccountKey $acct.StorageAccountKey -ErrorAction Stop
-    Write-RestoreLog "Connected to $name ($storageType)"
+    $ctx = New-AzStorageContext -StorageAccountName $acctName -StorageAccountKey $acctKey -ErrorAction Stop
+    Write-RestoreLog "Connected to $acctName ($storageType)"
+    Write-Host "    $acctName / $fileSystem ($storageType)" -ForegroundColor Cyan
 
-    $restored = 0
-    $failed = 0
-    $results = [System.Collections.Generic.List[PSCustomObject]]::new()
+    # ── Resume support: detect previously restored items ─────────────────
+    $alreadyRestored = [System.Collections.Generic.HashSet[string]]::new()
+    if (Test-Path $logFile) {
+        Get-Content $logFile -Encoding UTF8 -ErrorAction SilentlyContinue | ForEach-Object {
+            if ($_ -match '\[SUCCESS\] \[\d+/\d+\] RESTORED (.+)$') {
+                [void]$alreadyRestored.Add($Matches[1])
+            }
+        }
+        if ($alreadyRestored.Count -gt 0) {
+            Write-Host "      Resuming: skipping $($alreadyRestored.Count) already-restored items" -ForegroundColor Yellow
+            Write-RestoreLog "Resume: $($alreadyRestored.Count) items previously restored — skipping"
+        }
+    }
 
     if ($storageType -eq 'ADLS Gen2') {
-        # ── ADLS Gen2 restore ────────────────────────────────────────
+        # ── ADLS Gen2: Enumerate ─────────────────────────────────────────
+        Write-Host "      Enumerating deleted items..." -NoNewline
+        $toRestore = [System.Collections.Generic.List[hashtable]]::new()
         $token = $null
-        $toRestore = [System.Collections.Generic.List[object]]::new()
-
         do {
             try {
-                $deleted = Get-AzDataLakeGen2DeletedItem -Context $ctx -FileSystem $acct.FileSystem `
-                    -Path $acct.Path -MaxCount 100 -ContinuationToken $token -ErrorAction Stop
-
-                if (-not $deleted -or $deleted.Count -eq 0) { break }
-
-                foreach ($d in $deleted) {
+                $page = Get-AzDataLakeGen2DeletedItem -Context $ctx -FileSystem $fileSystem `
+                    -Path $acct.Path -MaxCount 5000 -ContinuationToken $token -ErrorAction Stop
+                if (-not $page -or $page.Count -eq 0) { break }
+                foreach ($d in $page) {
                     if ($sinceDateFilter -and $d.DeletedOn -and $d.DeletedOn -lt $sinceDateFilter) { continue }
                     if ($beforeDateFilter -and $d.DeletedOn -and $d.DeletedOn -ge $beforeDateFilter) { continue }
-                    $toRestore.Add($d)
+                    $p = $d.Path
+                    if ($alreadyRestored.Contains($p)) { continue }
+                    $did = try { $d.DeletionId } catch { '' }
+                    $don = if ($d.DeletedOn) { $d.DeletedOn.UtcDateTime.ToString('yyyy-MM-dd HH:mm:ss UTC') } else { '(unknown)' }
+                    $sz  = try { if ($d.ContentLength) { $d.ContentLength } else { 0 } } catch { 0 }
+                    $toRestore.Add(@{
+                        Path       = $p
+                        DeletionId = $did
+                        DeletedOn  = $don
+                        SizeBytes  = $sz
+                    })
                 }
-
-                $token = $deleted[$deleted.Count - 1].ContinuationToken
+                Write-Host "`r      Enumerating deleted items... $($toRestore.Count) found" -NoNewline
+                $token = $page[$page.Count - 1].ContinuationToken
             } catch {
-                Write-RestoreLog "Error during discovery: $_" -Level ERROR
+                Write-RestoreLog "Enumeration error: $_" -Level ERROR
+                Write-Host ""
+                Write-Host "      [ERROR] Enumeration failed: $_" -ForegroundColor Red
                 break
             }
         } while (-not [string]::IsNullOrEmpty($token))
-
+        Write-Host ""
         Write-RestoreLog "Found $($toRestore.Count) items to restore"
-        $totalToRestore = $toRestore.Count
-        "restoring|0|$totalToRestore" | Out-File -FilePath $progressFile -Force -Encoding UTF8
 
-        $i = 0
-        foreach ($item in $toRestore) {
-            $i++
-            $itemPath = $item.Path
-            $deletedOn = $item.DeletedOn
-            $deletedOnStr = if ($deletedOn) { $deletedOn.UtcDateTime.ToString('yyyy-MM-dd HH:mm:ss UTC') } else { '(unknown)' }
-            $contentLength = try { $item.ContentLength } catch { 0 }
-            if (-not $contentLength) { $contentLength = 0 }
-
-            try {
-                $null = $item | Restore-AzDataLakeGen2DeletedItem -ErrorAction Stop
-                $restored++
-                Write-RestoreLog "[$i/$($toRestore.Count)] RESTORED $itemPath" -Level SUCCESS
-                $results.Add([PSCustomObject]@{
-                    StorageAccount = $name
-                    StorageType    = 'ADLS Gen2'
-                    FileSystem     = $acct.FileSystem
-                    Path           = $itemPath
-                    DeletedOn      = $deletedOnStr
-                    SizeBytes      = $contentLength
-                    Status         = 'Restored'
-                    Error          = ''
-                })
-            } catch {
-                $failed++
-                Write-RestoreLog "[$i/$($toRestore.Count)] FAILED $itemPath - $_" -Level ERROR
-                $results.Add([PSCustomObject]@{
-                    StorageAccount = $name
-                    StorageType    = 'ADLS Gen2'
-                    FileSystem     = $acct.FileSystem
-                    Path           = $itemPath
-                    DeletedOn      = $deletedOnStr
-                    SizeBytes      = $contentLength
-                    Status         = 'Failed'
-                    Error          = $_.ToString()
-                })
+        if ($toRestore.Count -eq 0) {
+            Write-Host "      Nothing to restore." -ForegroundColor Yellow
+            $restoreResults += [PSCustomObject]@{
+                StorageAccount = $acctName; StorageType = $storageType; FileSystem = $fileSystem
+                Attempted = 0; Restored = 0; Failed = 0; LogFile = $logFile; CsvFile = $csvFile
             }
-            "restoring|$i|$totalToRestore" | Out-File -FilePath $progressFile -Force -Encoding UTF8
+            continue
+        }
+
+        # ── ADLS Gen2: Parallel restore ──────────────────────────────────
+        $totalItems = $toRestore.Count
+        Write-Host "      Restoring $totalItems items ($MaxConcurrency parallel workers, adaptive throttle)..."
+        $restoreStart = Get-Date
+        $restoredCount = 0
+        $failedCount = 0
+        $throttledCount = 0
+
+        # Shared throttle state across all workers: [0]=hitCount, [1]=lastHitEpochMs
+        # When ANY worker gets a 429, all workers see it and back off.
+        $throttleState = [long[]]::new(2)
+
+        $toRestore | ForEach-Object -Parallel {
+            $item       = $_
+            $sName      = $using:acctName
+            $sKey       = $using:acctKey
+            $fs         = $using:fileSystem
+            $maxRetries = $using:MaxRetries
+            $thr        = $using:throttleState
+            $baseDelay  = $using:WorkerDelayMs
+
+            Import-Module Az.Storage -MinimumVersion 4.9.0
+            $c = New-AzStorageContext -StorageAccountName $sName -StorageAccountKey $sKey
+
+            # ── Rate limiting + adaptive pacing ──────────────────────────
+            # Hard floor: enforce MaxRequestsPerSecond ceiling
+            if ($baseDelay -gt 0) {
+                Start-Sleep -Milliseconds ($baseDelay + (Get-Random -Maximum ([math]::Max(1, $baseDelay / 2))))
+            } else {
+                Start-Sleep -Milliseconds (Get-Random -Minimum 10 -Maximum 50)
+            }
+            # Soft adaptive: if recent throttling detected, ALL workers back off more
+            $now = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+            $msSinceHit = $now - $thr[1]
+            if ($thr[0] -gt 0 -and $msSinceHit -lt 60000) {
+                $delay = [math]::Min(10000, $thr[0] * 300 + (Get-Random -Maximum 500))
+                Start-Sleep -Milliseconds $delay
+            }
+
+            $status = 'Failed'
+            $errMsg = ''
+            $wasThrottled = $false
+            for ($att = 1; $att -le ($maxRetries + 1); $att++) {
+                try {
+                    Restore-AzDataLakeGen2DeletedItem -Context $c -FileSystem $fs `
+                        -DeletedPath $item.Path -DeletionId $item.DeletionId -ErrorAction Stop
+                    $status = 'Restored'
+                    break
+                } catch {
+                    $errMsg = $_.ToString()
+                    if ($att -le $maxRetries -and $errMsg -match '429|503|throttl|busy|SlowDown|ServerBusy') {
+                        $wasThrottled = $true
+                        # Signal ALL workers to slow down
+                        [System.Threading.Interlocked]::Increment([ref]$thr[0])
+                        $thr[1] = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+                        # Per-retry exponential backoff + jitter
+                        $backoff = [math]::Min(60000, [math]::Pow(2, $att) * 1000 + (Get-Random -Maximum 2000))
+                        Start-Sleep -Milliseconds $backoff
+                    } else { break }
+                }
+            }
+
+            # Decay throttle pressure after sustained success (no hits for 30s)
+            if (-not $wasThrottled -and $thr[0] -gt 0) {
+                $quiet = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() - $thr[1]
+                if ($quiet -gt 30000) {
+                    $current = $thr[0]
+                    if ($current -gt 0) {
+                        [System.Threading.Interlocked]::CompareExchange([ref]$thr[0], [math]::Max(0, $current - 1), $current) | Out-Null
+                    }
+                }
+            }
+
+            $errOut = if ($status -eq 'Failed') { $errMsg } else { '' }
+            [PSCustomObject]@{
+                StorageAccount = $sName; StorageType = 'ADLS Gen2'; FileSystem = $fs
+                Path = $item.Path; DeletedOn = $item.DeletedOn; SizeBytes = $item.SizeBytes
+                Status = $status; Error = $errOut
+                WasThrottled = $wasThrottled
+            }
+        } -ThrottleLimit $MaxConcurrency | ForEach-Object {
+            # Main thread: log results and track progress as they stream in
+            $r = $_
+            if ($r.Status -eq 'Restored') { $restoredCount++ } else { $failedCount++ }
+            if ($r.WasThrottled) { $throttledCount++ }
+            $idx = $restoredCount + $failedCount
+            $level  = if ($r.Status -eq 'Restored') { 'SUCCESS' } else { 'ERROR' }
+            $detail = if ($r.Status -eq 'Restored') { "RESTORED $($r.Path)" } else { "FAILED $($r.Path) - $($r.Error)" }
+            Write-RestoreLog "[$idx/$totalItems] $detail" -Level $level
+
+            if ($idx % 200 -eq 0 -or $idx -eq $totalItems -or $r.Status -eq 'Failed') {
+                $elapsed = (Get-Date) - $restoreStart
+                $rate = if ($elapsed.TotalSeconds -gt 0) { [math]::Round($idx / $elapsed.TotalSeconds, 1) } else { 0 }
+                $pct  = [math]::Round($idx / $totalItems * 100, 1)
+                $eta  = if ($rate -gt 0) { [TimeSpan]::FromSeconds(($totalItems - $idx) / $rate).ToString('hh\:mm\:ss') } else { '--:--:--' }
+                $thrLabel = if ($throttledCount -gt 0) { " | Throttled:$throttledCount" } else { '' }
+                Write-Progress -Activity "Restoring $acctName/$fileSystem" `
+                    -Status "[$idx/$totalItems] $pct% | $rate/sec | ETA $eta | OK:$restoredCount Fail:$failedCount$thrLabel" `
+                    -PercentComplete ([math]::Min(100, [int]$pct))
+            }
+            $r  # pass through to CSV
+        } | Export-Csv -Path $csvFile -NoTypeInformation -Encoding UTF8 -Force
+
+        Write-Progress -Activity "Restoring $acctName/$fileSystem" -Completed
+        $restoreDuration = (Get-Date) - $restoreStart
+        Write-RestoreLog "Complete: $restoredCount restored, $failedCount failed in $($restoreDuration.ToString('hh\:mm\:ss'))"
+
+        $color = if ($failedCount -gt 0) { 'Yellow' } else { 'Green' }
+        Write-Host "      Done: $restoredCount restored, $failedCount failed ($($restoreDuration.ToString('hh\:mm\:ss')))" -ForegroundColor $color
+        Write-Host ""
+
+        $restoreResults += [PSCustomObject]@{
+            StorageAccount = $acctName; StorageType = $storageType; FileSystem = $fileSystem
+            Attempted = $totalItems; Restored = $restoredCount; Failed = $failedCount
+            LogFile = $logFile; CsvFile = $csvFile
         }
 
     } else {
-        # ── Blob Storage restore ─────────────────────────────────────
+        # ── Blob Storage: Enumerate ──────────────────────────────────────
+        Write-Host "      Enumerating deleted blobs..." -NoNewline
+        $toRestore = [System.Collections.Generic.List[hashtable]]::new()
         $token = $null
-        $toRestore = [System.Collections.Generic.List[object]]::new()
-
         do {
             try {
                 $blobParams = @{
-                    Container      = $acct.FileSystem
-                    Context        = $ctx
-                    IncludeDeleted = $true
-                    MaxCount       = 100
-                    ErrorAction    = 'Stop'
+                    Container = $fileSystem; Context = $ctx; IncludeDeleted = $true
+                    MaxCount = 5000; ErrorAction = 'Stop'
                 }
-                $pathPrefix = $acct.Path.Trim('/')
-                if ($pathPrefix -and $pathPrefix -ne '') {
-                    $blobParams['Prefix'] = $pathPrefix
-                }
-                if ($token) {
-                    $blobParams['ContinuationToken'] = $token
-                }
+                $prefix = $acct.Path.Trim('/')
+                if ($prefix -and $prefix -ne '') { $blobParams['Prefix'] = $prefix }
+                if ($token) { $blobParams['ContinuationToken'] = $token }
 
-                $blobResult = Get-AzStorageBlob @blobParams
+                $page = Get-AzStorageBlob @blobParams
+                if (-not $page -or $page.Count -eq 0) { break }
 
-                if (-not $blobResult -or $blobResult.Count -eq 0) { break }
-
-                foreach ($blob in $blobResult) {
+                foreach ($blob in $page) {
                     if (-not $blob.IsDeleted) { continue }
                     if ($sinceDateFilter -and $blob.DeletedOn -and $blob.DeletedOn -lt $sinceDateFilter) { continue }
                     if ($beforeDateFilter -and $blob.DeletedOn -and $blob.DeletedOn -ge $beforeDateFilter) { continue }
-                    $toRestore.Add($blob)
+                    $bName = $blob.Name
+                    if ($alreadyRestored.Contains($bName)) { continue }
+                    $don = if ($blob.DeletedOn) { $blob.DeletedOn.UtcDateTime.ToString('yyyy-MM-dd HH:mm:ss UTC') } else { '(unknown)' }
+                    $sz  = try { if ($blob.Length) { $blob.Length } else { 0 } } catch { 0 }
+                    $toRestore.Add(@{
+                        Name      = $bName
+                        DeletedOn = $don
+                        SizeBytes = $sz
+                    })
                 }
-
-                $token = $blobResult[$blobResult.Count - 1].ContinuationToken
+                Write-Host "`r      Enumerating deleted blobs... $($toRestore.Count) found" -NoNewline
+                $token = $page[$page.Count - 1].ContinuationToken
             } catch {
-                Write-RestoreLog "Error during discovery: $_" -Level ERROR
+                Write-RestoreLog "Enumeration error: $_" -Level ERROR
+                Write-Host ""
+                Write-Host "      [ERROR] Enumeration failed: $_" -ForegroundColor Red
                 break
             }
         } while (-not [string]::IsNullOrEmpty($token))
-
+        Write-Host ""
         Write-RestoreLog "Found $($toRestore.Count) deleted blobs to restore"
-        $totalToRestore = $toRestore.Count
-        "restoring|0|$totalToRestore" | Out-File -FilePath $progressFile -Force -Encoding UTF8
 
-        $i = 0
-        foreach ($blob in $toRestore) {
-            $i++
-            $blobName = $blob.Name
-            $deletedOn = $blob.DeletedOn
-            $deletedOnStr = if ($deletedOn) { $deletedOn.UtcDateTime.ToString('yyyy-MM-dd HH:mm:ss UTC') } else { '(unknown)' }
-            $contentLength = try { $blob.Length } catch { 0 }
-            if (-not $contentLength) { $contentLength = 0 }
-
-            try {
-                $blob.BlobBaseClient.Undelete()
-                $restored++
-                Write-RestoreLog "[$i/$($toRestore.Count)] RESTORED $blobName" -Level SUCCESS
-                $results.Add([PSCustomObject]@{
-                    StorageAccount = $name
-                    StorageType    = 'Blob'
-                    FileSystem     = $acct.FileSystem
-                    Path           = $blobName
-                    DeletedOn      = $deletedOnStr
-                    SizeBytes      = $contentLength
-                    Status         = 'Restored'
-                    Error          = ''
-                })
-            } catch {
-                $failed++
-                Write-RestoreLog "[$i/$($toRestore.Count)] FAILED $blobName - $_" -Level ERROR
-                $results.Add([PSCustomObject]@{
-                    StorageAccount = $name
-                    StorageType    = 'Blob'
-                    FileSystem     = $acct.FileSystem
-                    Path           = $blobName
-                    DeletedOn      = $deletedOnStr
-                    SizeBytes      = $contentLength
-                    Status         = 'Failed'
-                    Error          = $_.ToString()
-                })
+        if ($toRestore.Count -eq 0) {
+            Write-Host "      Nothing to restore." -ForegroundColor Yellow
+            $restoreResults += [PSCustomObject]@{
+                StorageAccount = $acctName; StorageType = $storageType; FileSystem = $fileSystem
+                Attempted = 0; Restored = 0; Failed = 0; LogFile = $logFile; CsvFile = $csvFile
             }
-            "restoring|$i|$totalToRestore" | Out-File -FilePath $progressFile -Force -Encoding UTF8
+            continue
         }
-    }
 
-    # Mark restore complete
-    "done|$restored|$failed" | Out-File -FilePath $progressFile -Force -Encoding UTF8
+        # ── Blob Storage: Parallel restore ───────────────────────────────
+        $totalItems = $toRestore.Count
+        Write-Host "      Restoring $totalItems blobs ($MaxConcurrency parallel workers, adaptive throttle)..."
+        $restoreStart = Get-Date
+        $restoredCount = 0
+        $failedCount = 0
+        $throttledCount = 0
 
-    # Write restore CSV
-    if ($results.Count -gt 0) {
-        $results | Export-Csv -Path $csvFile -NoTypeInformation -Encoding UTF8 -Force
-    }
+        # Shared throttle state across all workers: [0]=hitCount, [1]=lastHitEpochMs
+        $throttleState = [long[]]::new(2)
 
-    Write-RestoreLog "Complete: $restored restored, $failed failed"
+        $toRestore | ForEach-Object -Parallel {
+            $item       = $_
+            $sName      = $using:acctName
+            $sKey       = $using:acctKey
+            $fs         = $using:fileSystem
+            $maxRetries = $using:MaxRetries
+            $thr        = $using:throttleState
+            $baseDelay  = $using:WorkerDelayMs
 
-    [PSCustomObject]@{
-        StorageAccount = $name
-        StorageType    = $storageType
-        FileSystem     = $acct.FileSystem
-        Attempted      = $toRestore.Count
-        Restored       = $restored
-        Failed         = $failed
-        LogFile        = $logFile
-        CsvFile        = $csvFile
-    }
-} -ThrottleLimit 10 -AsJob
+            Import-Module Az.Storage -MinimumVersion 4.9.0
+            $c = New-AzStorageContext -StorageAccountName $sName -StorageAccountKey $sKey
 
-# Poll restore progress
-$completedRestores = @{}
-while ($restoreJob.State -eq 'Running') {
-    $grandDone = 0
-    $grandTotal = 0
-    foreach ($acct in $validAccounts) {
-        $acctLabel = "$($acct.StorageAccountName)_$($acct.FileSystem)"
-        $pFile = Join-Path $progressDir "${acctLabel}_restore.txt"
-        if (Test-Path $pFile) {
-            $pContent = (Get-Content $pFile -Raw -ErrorAction SilentlyContinue)
-            if ($pContent) {
-                $parts = $pContent.Trim() -split '\|'
-                $status = $parts[0]
-                if ($status -eq 'done' -and -not $completedRestores[$acctLabel]) {
-                    $completedRestores[$acctLabel] = $true
-                    $doneRestored = if ($parts.Count -gt 1) { $parts[1] } else { '0' }
-                    $doneFailed = if ($parts.Count -gt 2) { $parts[2] } else { '0' }
-                    $color = if ([int]$doneFailed -gt 0) { 'Yellow' } else { 'Green' }
-                    Write-Host "    [DONE] $($acct.StorageAccountName) / $($acct.FileSystem) — $doneRestored restored, $doneFailed failed" -ForegroundColor $color
-                } elseif ($status -eq 'restoring') {
-                    $current = if ($parts.Count -gt 1) { [int]$parts[1] } else { 0 }
-                    $total = if ($parts.Count -gt 2) { [int]$parts[2] } else { 0 }
-                    $grandDone += $current
-                    $grandTotal += $total
+            # ── Rate limiting + adaptive pacing ──────────────────────────
+            if ($baseDelay -gt 0) {
+                Start-Sleep -Milliseconds ($baseDelay + (Get-Random -Maximum ([math]::Max(1, $baseDelay / 2))))
+            } else {
+                Start-Sleep -Milliseconds (Get-Random -Minimum 10 -Maximum 50)
+            }
+            $now = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+            $msSinceHit = $now - $thr[1]
+            if ($thr[0] -gt 0 -and $msSinceHit -lt 60000) {
+                $delay = [math]::Min(10000, $thr[0] * 300 + (Get-Random -Maximum 500))
+                Start-Sleep -Milliseconds $delay
+            }
+
+            $status = 'Failed'
+            $errMsg = ''
+            $wasThrottled = $false
+            for ($att = 1; $att -le ($maxRetries + 1); $att++) {
+                try {
+                    # Create blob client directly via SDK and undelete
+                    $cred = [Azure.Storage.StorageSharedKeyCredential]::new($sName, $sKey)
+                    $uri  = [Uri]::new("https://${sName}.blob.core.windows.net/${fs}/$($item.Name)")
+                    $blobClient = [Azure.Storage.Blobs.Specialized.BlobBaseClient]::new($uri, $cred)
+                    $blobClient.Undelete()
+                    $status = 'Restored'
+                    break
+                } catch {
+                    $errMsg = $_.ToString()
+                    if ($att -le $maxRetries -and $errMsg -match '429|503|throttl|busy|SlowDown|ServerBusy') {
+                        $wasThrottled = $true
+                        [System.Threading.Interlocked]::Increment([ref]$thr[0])
+                        $thr[1] = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+                        $backoff = [math]::Min(60000, [math]::Pow(2, $att) * 1000 + (Get-Random -Maximum 2000))
+                        Start-Sleep -Milliseconds $backoff
+                    } else { break }
                 }
             }
-        }
-    }
-    # Add completed accounts to totals
-    foreach ($acct in $validAccounts) {
-        $acctLabel = "$($acct.StorageAccountName)_$($acct.FileSystem)"
-        if ($completedRestores[$acctLabel]) {
-            $pFile = Join-Path $progressDir "${acctLabel}_restore.txt"
-            $pContent = (Get-Content $pFile -Raw -ErrorAction SilentlyContinue)
-            if ($pContent) {
-                $parts = $pContent.Trim() -split '\|'
-                $doneR = if ($parts.Count -gt 1) { [int]$parts[1] } else { 0 }
-                $doneF = if ($parts.Count -gt 2) { [int]$parts[2] } else { 0 }
-                $grandDone += ($doneR + $doneF)
-                $grandTotal += ($doneR + $doneF)
+
+            # Decay throttle pressure after sustained success
+            if (-not $wasThrottled -and $thr[0] -gt 0) {
+                $quiet = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() - $thr[1]
+                if ($quiet -gt 30000) {
+                    $current = $thr[0]
+                    if ($current -gt 0) {
+                        [System.Threading.Interlocked]::CompareExchange([ref]$thr[0], [math]::Max(0, $current - 1), $current) | Out-Null
+                    }
+                }
             }
+
+            $errOut = if ($status -eq 'Failed') { $errMsg } else { '' }
+            [PSCustomObject]@{
+                StorageAccount = $sName; StorageType = 'Blob'; FileSystem = $fs
+                Path = $item.Name; DeletedOn = $item.DeletedOn; SizeBytes = $item.SizeBytes
+                Status = $status; Error = $errOut
+                WasThrottled = $wasThrottled
+            }
+        } -ThrottleLimit $MaxConcurrency | ForEach-Object {
+            $r = $_
+            if ($r.Status -eq 'Restored') { $restoredCount++ } else { $failedCount++ }
+            if ($r.WasThrottled) { $throttledCount++ }
+            $idx = $restoredCount + $failedCount
+            $level  = if ($r.Status -eq 'Restored') { 'SUCCESS' } else { 'ERROR' }
+            $detail = if ($r.Status -eq 'Restored') { "RESTORED $($r.Path)" } else { "FAILED $($r.Path) - $($r.Error)" }
+            Write-RestoreLog "[$idx/$totalItems] $detail" -Level $level
+
+            if ($idx % 200 -eq 0 -or $idx -eq $totalItems -or $r.Status -eq 'Failed') {
+                $elapsed = (Get-Date) - $restoreStart
+                $rate = if ($elapsed.TotalSeconds -gt 0) { [math]::Round($idx / $elapsed.TotalSeconds, 1) } else { 0 }
+                $pct  = [math]::Round($idx / $totalItems * 100, 1)
+                $eta  = if ($rate -gt 0) { [TimeSpan]::FromSeconds(($totalItems - $idx) / $rate).ToString('hh\:mm\:ss') } else { '--:--:--' }
+                $thrLabel = if ($throttledCount -gt 0) { " | Throttled:$throttledCount" } else { '' }
+                Write-Progress -Activity "Restoring $acctName/$fileSystem" `
+                    -Status "[$idx/$totalItems] $pct% | $rate/sec | ETA $eta | OK:$restoredCount Fail:$failedCount$thrLabel" `
+                    -PercentComplete ([math]::Min(100, [int]$pct))
+            }
+            $r
+        } | Export-Csv -Path $csvFile -NoTypeInformation -Encoding UTF8 -Force
+
+        Write-Progress -Activity "Restoring $acctName/$fileSystem" -Completed
+        $restoreDuration = (Get-Date) - $restoreStart
+        Write-RestoreLog "Complete: $restoredCount restored, $failedCount failed in $($restoreDuration.ToString('hh\:mm\:ss'))"
+
+        $color = if ($failedCount -gt 0) { 'Yellow' } else { 'Green' }
+        Write-Host "      Done: $restoredCount restored, $failedCount failed ($($restoreDuration.ToString('hh\:mm\:ss')))" -ForegroundColor $color
+        Write-Host ""
+
+        $restoreResults += [PSCustomObject]@{
+            StorageAccount = $acctName; StorageType = $storageType; FileSystem = $fileSystem
+            Attempted = $totalItems; Restored = $restoredCount; Failed = $failedCount
+            LogFile = $logFile; CsvFile = $csvFile
         }
     }
-    $pct = if ($grandTotal -gt 0) { [math]::Min(100, [math]::Round(($grandDone / $grandTotal) * 100)) } else { 0 }
-    Write-Progress -Activity "Restoring deleted items" -Status "$grandDone of $grandTotal items ($pct%)" -PercentComplete $pct
-    Start-Sleep -Milliseconds 500
 }
-
-# Show any remaining completions
-foreach ($acct in $validAccounts) {
-    $acctLabel = "$($acct.StorageAccountName)_$($acct.FileSystem)"
-    if ($completedRestores[$acctLabel]) { continue }
-    $pFile = Join-Path $progressDir "${acctLabel}_restore.txt"
-    if (Test-Path $pFile) {
-        $pContent = (Get-Content $pFile -Raw -ErrorAction SilentlyContinue)
-        if ($pContent) {
-            $parts = $pContent.Trim() -split '\|'
-            $doneRestored = if ($parts.Count -gt 1) { $parts[1] } else { '0' }
-            $doneFailed = if ($parts.Count -gt 2) { $parts[2] } else { '0' }
-            $color = if ([int]$doneFailed -gt 0) { 'Yellow' } else { 'Green' }
-            Write-Host "    [DONE] $($acct.StorageAccountName) / $($acct.FileSystem) — $doneRestored restored, $doneFailed failed" -ForegroundColor $color
-        }
-    }
-}
-
-Write-Progress -Activity "Restoring deleted items" -Completed
-$restoreResults = @($restoreJob | Receive-Job -Wait -AutoRemoveJob)
 
 # Clean up progress files
 Remove-Item -Path $progressDir -Recurse -Force -ErrorAction SilentlyContinue

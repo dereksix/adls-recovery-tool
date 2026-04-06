@@ -78,3 +78,19 @@ $BeforeDate = ""
 
 # Where to save log and CSV files. Default: same folder as the script.
 $OutputFolder = ""
+
+# Number of concurrent restore operations per storage account.
+# Higher = faster, but uses more of the account's API budget.
+# This is a SHARED account — other workloads need headroom.
+# Default: 64 workers. Hard-capped at 256 to stay safe.
+$MaxConcurrency = 64
+
+# Hard ceiling on requests per second (across all workers).
+# Workers will pace themselves to stay under this limit.
+# The account limit is ~20,000 req/sec but you're sharing it.
+# Default: 500. Safe range: 100–2000.
+$MaxRequestsPerSecond = 500
+
+# Retry attempts for transient failures (429 throttling, 503 service busy).
+# Uses exponential backoff between retries.
+$MaxRetries = 3
